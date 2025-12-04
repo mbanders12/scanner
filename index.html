@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Student ID Scanner</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <!-- ZXing for barcode scanning -->
+<script src="https://unpkg.com/@zxing/library@0.20.0/umd/index.min.js"></script>
+
+  <style>
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 5;
+      padding: 0.75rem;
+      background: #f5f5f5;
+      color: #222;
+    }
+    h1 {
+      font-size: 1.3rem;
+      text-align: center;
+      margin-bottom: 0.5rem;
+    }
+    #controls {
+      display: flex;
+      gap: 0.5rem;
+      justify-content: center;
+      margin-bottom: 0.75rem;
+      flex-wrap: wrap;
+    }
+    button {
+      padding: 0.5rem 0.75rem;
+      border-radius: 0.4rem;
+      border: none;
+      font-size: 0.9rem;
+      background: #1976d2;
+      color: white;
+    }
+    button[disabled] {
+      opacity: 0.5;
+      background: #777;
+    }
+    #video-container {
+      display: flex;
+      justify-content: center;
+      margin-bottom: 0.75rem;
+    }
+    video {
+      width: 100%;
+      max-width: 480px;
+      border-radius: 0.5rem;
+      background: #000;
+    }
+    #status, #sheet-status {
+      font-size: 0.8rem;
+      text-align: center;
+      margin-bottom: 0.25rem;
+    }
+    #status {
+      color: #444;
+    }
+    #sheet-status {
+      color: #2e7d32;
+    }
+    #scans-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-top: 0.75rem;
+    }
+    #scan-list {
+      margin-top: 0.25rem;
+      max-height: 45vh;
+      overflow-y: auto;
+      background: white;
+      border-radius: 0.5rem;
+      padding: 0.5rem;
+      box-shadow: 0 0 3px rgba(0,0,0,0.15);
+    }
+    .scan-row {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.85rem;
+      padding: 0.25rem 0.15rem;
+      border-bottom: 1px solid #eee;
+    }
+    .scan-row:last-child {
+      border-bottom: none;
+    }
+    .scan-id {
+      font-weight: 600;
+    }
+    .scan-meta {
+      text-align: right;
+    }
+    .badge {
+      font-size: 0.7rem;
+      padding: 0.05rem 0.35rem;
+      border-radius: 999px;
+      display: inline-block;
+    }
+    .badge-ok {
+      background: #c8e6c9;
+      color: #256029;
+    }
+    .badge-miss {
+      background: #ffcdd2;
+      color: #b71c1c;
+    }
+  </style>
+</head>
+<body>
+  <h1>Student ID Scanner</h1>
+
+  <div id="controls">
+    <button id="startBtn">Start Scanner</button>
+    <button id="stopBtn" disabled>Stop Scanner</button>
+    <button id="exportBtn" disabled>Export CSV</button>
+    <button id="clearBtn" disabled>Clear List</button>
+  </div>
+
+  <div id="status">Tap “Start Scanner” and allow camera access.</div>
+  <div id="sheet-status"></div>
+
+  <div id="video-container">
+    <video id="video" autoplay playsinline></video>
+  </div>
+
+  <div id="scans-header">
+    <strong>Scanned IDs</strong>
+    <span>Total: <span id="scan-count">0</span></span>
+  </div>
+
+  <div id="scan-list"></div>
+
+  <script>
+    // OPTIONAL: if you set this to your Apps Script URL, the app
+    // will load the list of valid IDs from Column D of 'Today'.
+    const SHEET_WEB_APP_URL = ""; // e.g. "https://script.google.com/macros/s/XXXXX/exec"
+
+    const { BrowserMultiFormatReader } = ZXing;
+
+    const videoElem = document.getElementById('video');
+    const statusElem = document.getElementById('status');
+    const sheetStatusElem = document.getElementById('sheet-status');
+    const scanListElem = document.getElementById('scan-list');
+    const scanCountElem = document.getElementById('scan-count');
+
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const exportBtn = document.getElementById('exportBtn');
+    const clearBtn = document.getElementById('clearBtn');
+
+    let codeReader = null;
+    let scanning = false;
+    let lastText = "";
+    let lastTime = 0;
+
+    const scans = []; // { id, timestamp, inSheet }
+    let sheetIdSet = null; // Set of IDs from Column D, if loaded
+
+    // ---- Load IDs from Google Sheet (optional) ----
+    async function loadSheetIds() {
+      if (!SHEET_WEB_APP_URL) {
+        sheetStatusElem.textContent = "Sheet lookup disabled (no web app URL set).";
+        return;
+      }
+      sheetStatusElem.textContent = "Loading authorized IDs from sheet...";
+      try {
+        const res = await fetch(SHEET_WEB_APP_URL);
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const data = await res.json();
+        if (Array.isArray(data.ids)) {
+          sheetIdSet = new Set(data.ids.map(String));
+          sheetStatusElem.textContent = "Loaded " + data.ids.length + " IDs from sheet.";
+        } else {
+          sheetStatusElem.textContent = "Sheet response format unexpected.";
+        }
+      } catch (err) {
+        console.error(err);
+        sheetStatusElem.textContent = "Could not load IDs from sheet.";
+      }
+    }
+
+    // ---- Scanner control ----
+async function startScanner() {
+  if (scanning) return;
+
+  // Make sure ZXing loaded
+  if (!window.ZXing || !window.ZXing.BrowserMultiFormatReader) {
+    statusElem.textContent = "Scanner library failed to load.";
+    showToast("Error loading scanner library", true);
+    return;
+  }
+
+  try {
+    const ZX = window.ZXing;
+    codeReader = new ZX.BrowserMultiFormatReader();
+
+    const devices = await codeReader.listVideoInputDevices();
+    if (!devices.length) {
+      statusElem.textContent = "No camera found.";
+      showToast("No camera found", true);
+      return;
+    }
+
+    const preferred = devices.find(d =>
+      /back|rear|environment/i.test(d.label)
+    ) || devices[0];
+
+    scanning = true;
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
+    statusElem.textContent = "Scanning... point camera at an ID barcode.";
+
+    await codeReader.decodeFromVideoDevice(
+      preferred.deviceId,
+      videoElem,
+      (result, err) => {
+        if (!result) return;
+        const now = Date.now();
+        const text = String(result.getText ? result.getText() : result.text || "");
+        if (!text) return;
+
+        if (text === lastText && now - lastTime < 800) return;
+        lastText = text;
+        lastTime = now;
+
+        handleScan(text);
+      }
+    );
+  } catch (err) {
+    console.error(err);
+    scanning = false;
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    statusElem.textContent = "Error starting scanner: " + err;
+    showToast("Could not start scanner", true);
+  }
+}
+
+
+    async function stopScanner() {
+      if (!scanning || !codeReader) return;
+      await codeReader.reset();
+      scanning = false;
+      statusElem.textContent = "Scanner stopped.";
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+    }
+
+    // ---- Handle scan ----
+    function handleScan(rawText) {
+      // Extract numeric portion only
+      const numeric = rawText.replace(/\D/g, "");
+      if (!numeric) {
+        statusElem.textContent = `Scanned non-numeric code: ${rawText}`;
+        return;
+      }
+
+      const timestamp = new Date().toLocaleTimeString();
+      const inSheet = sheetIdSet ? sheetIdSet.has(numeric) : null;
+
+      scans.push({ id: numeric, timestamp, inSheet });
+      updateScanList();
+
+      statusElem.textContent = `Scanned: ${numeric}` + (inSheet === true ? " (found in sheet)" :
+                             inSheet === false ? " (NOT in sheet)" : "");
+
+      // tiny vibration if supported
+      if (navigator.vibrate) navigator.vibrate(40);
+    }
+
+    function updateScanList() {
+      scanCountElem.textContent = scans.length;
+      exportBtn.disabled = scans.length === 0;
+      clearBtn.disabled = scans.length === 0;
+
+      scanListElem.innerHTML = "";
+      for (const s of scans.slice().reverse()) { // newest first
+        const row = document.createElement('div');
+        row.className = 'scan-row';
+
+        const left = document.createElement('div');
+        left.className = 'scan-id';
+        left.textContent = s.id;
+
+        const right = document.createElement('div');
+        right.className = 'scan-meta';
+        right.innerHTML = s.timestamp;
+
+        if (s.inSheet !== null) {
+          const badge = document.createElement('span');
+          badge.className = 'badge ' + (s.inSheet ? 'badge-ok' : 'badge-miss');
+          badge.textContent = s.inSheet ? 'In sheet' : 'Not in sheet';
+          right.appendChild(document.createElement('br'));
+          right.appendChild(badge);
+        }
+
+        row.appendChild(left);
+        row.appendChild(right);
+        scanListElem.appendChild(row);
+      }
+    }
+
+    // ---- Export & Clear ----
+    function exportCSV() {
+      if (!scans.length) return;
+
+      const header = ["id","timestamp","in_sheet"];
+      const rows = scans.map(s => [
+        s.id,
+        s.timestamp.replace(/,/g, " "),
+        s.inSheet === null ? "" : (s.inSheet ? "YES" : "NO")
+      ]);
+      const csvLines = [header.join(","), ...rows.map(r => r.join(","))];
+      const blob = new Blob([csvLines.join("\n")], { type: "text/csv" });
+      const url = URL.createObjectURL(blob);
+
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = "scanned_ids.csv";
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }
+
+    function clearList() {
+      scans.length = 0;
+      updateScanList();
+      statusElem.textContent = "List cleared.";
+    }
+
+    // ---- Wire up buttons ----
+    startBtn.addEventListener('click', startScanner);
+    stopBtn.addEventListener('click', stopScanner);
+    exportBtn.addEventListener('click', exportCSV);
+    clearBtn.addEventListener('click', clearList);
+
+    // try to load sheet IDs on startup (if URL provided)
+    loadSheetIds();
+  </script>
+</body>
+</html>
